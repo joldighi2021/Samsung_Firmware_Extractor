@@ -1,0 +1,103 @@
+name: Samsung Ext4 Firmware Extractor.
+
+on:
+  workflow_dispatch:
+    inputs:
+      Firmware_Download_URL:
+        description: 'URL to download the Samsung firmware'
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository.
+        uses: actions/checkout@v2
+
+      - name: Downloading firmware.
+        run: |
+          wget -O firmware.zip --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/117.0" ${{ github.event.inputs.Firmware_Download_URL }}
+
+      - name: Cleaning unnecessary packages.
+        uses: rokibhasansagar/slimhub_actions@main
+     
+      - name: Installing packages.
+        run: |
+          sudo apt-get update && sudo apt install -y python3 p7zip-full lz4 android-sdk-libsparse-utils && pip3 install liblp
+
+      - name: Extracting firmware.
+        run: |
+          sudo 7z x firmware.zip && sudo rm -rf firmware.zip && sudo rm -rf *.txt && for file in *.md5; do sudo mv -- "$file" "${file%.md5}"; done
+
+      - name: Extracting tar files.
+        run: |
+          for file in *.tar; do sudo tar -xvf "$file"; done
+          sudo find . -type f ! -name 'super.img.lz4' ! -name 'optics.img.lz4' ! -name 'prism.img.lz4' ! -name 'boot.img.lz4' -delete
+          sudo rm -rf *.tar
+          sudo rm -rf meta-data
+
+      - name: Extracting lz4 files.
+        run: |
+          for file in *.lz4; do sudo lz4 -d "$file" "${file%.lz4}"; done
+          sudo rm -rf *.lz4
+
+      - name: Converting all images to raw img.
+        run: |
+          for file in *.img; do
+            if [ "$file" != "boot.img" ]; then
+               sudo simg2img "$file" "${file%.img}.img.raw"
+            else
+               echo "Skipping boot.img"
+            fi
+          done
+
+          sudo find \. -type f -name '*\.img' \! -name 'boot\.img' -delete
+          for file in *.raw; do sudo mv -- "$file" "${file%.raw}"; done
+
+      - name: Check and extract all partitions from super.img
+        run: |
+          if [ -f "super.img" ]; then
+            echo "super.img found. Extracting partitions..."
+            lpunpack super.img
+            rm -rf super.img
+          else
+            echo "super.img not found. Skipping..."
+          fi
+
+      - name: Collecting ROM info.
+        id: vars
+        run: |
+          sudo mkdir system && sudo mount -o rw -t auto system.img system
+          echo "DEVICE_MODEL=$(sudo grep 'ro.product.system.model' system/system/build.prop | cut -d'=' -f2)" >> $GITHUB_ENV
+          echo "ANDROID_VERSION=$(sudo grep 'ro.system.build.version.release_or_codename' system/system/build.prop | cut -d'=' -f2)" >> $GITHUB_ENV
+          echo "BUILD_VERSION=$(sudo grep 'ro.system.build.version.incremental' system/system/build.prop | cut -d'=' -f2)" >> $GITHUB_ENV
+          echo "CHIPSET=$(sudo grep 'Build.BRAND' system/system/build.prop | cut -d'=' -f2)" >> $GITHUB_ENV
+          sudo umount system && sudo rm -rf system
+
+      - name: Collecting .img file names and sizes.
+        id: img_info
+        run: |
+          img_info=$(find . -type f -name "*.img" -exec du -b {} + | awk '{print $2 " : " $1 " bytes"}' | tr '\n\n' ' ')
+          echo "IMG_INFO=$img_info" >> $GITHUB_ENV
+
+      - name: Compressing all images to xz format.
+        run: |
+          for i in *.img; do 7z a -mx9 "${i%.*}.img.xz" "$i" && rm "$i"; done
+
+      - name: Uploading to Release.
+        uses: softprops/action-gh-release@v1
+        with:
+          files: "*.xz"
+          name: "${{ env.BUILD_VERSION }}.zip"
+          tag_name: "${{ github.run_id }}"
+          body: |
+            Device: ${{ env.DEVICE_MODEL }}
+            Android Version: ${{ env.ANDROID_VERSION }}
+            Build Version: ${{ env.BUILD_VERSION }}
+            Chipset: ${{ env.CHIPSET }}
+
+            img files size:
+            ${{ env.IMG_INFO }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
